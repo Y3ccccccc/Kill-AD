@@ -25,6 +25,7 @@ import android.widget.TextView;
 public class MainActivity extends Activity {
 
     private TextView status;
+    private TextView banner;
     private TextView stats;
     private TextView logView;
     private TextView dbgView;
@@ -42,12 +43,30 @@ public class MainActivity extends Activity {
         root.setPadding(dp(20), dp(24), dp(20), dp(24));
         root.setBackgroundColor(Color.WHITE);
 
+        banner = new TextView(this);
+        banner.setText("⚠ 无障碍未开启，现在不会跳过任何广告 —— 点这里打开");
+        banner.setTextSize(13);
+        banner.setTextColor(Color.WHITE);
+        banner.setBackgroundColor(Color.rgb(200, 40, 40));
+        banner.setPadding(dp(14), dp(12), dp(14), dp(12));
+        banner.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                try {
+                    startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                } catch (Throwable t) {
+                    startActivity(new Intent(Settings.ACTION_SETTINGS));
+                }
+            }
+        });
+        root.addView(banner);
+
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("跳过开屏广告 v3.3");
+        title.setText("跳过开屏广告 v3.11");
         title.setTextSize(24);
         title.setTextColor(Color.rgb(20, 20, 20));
         header.addView(title, new LinearLayout.LayoutParams(0,
@@ -93,6 +112,15 @@ public class MainActivity extends Activity {
         });
         root.addView(master);
 
+        final Switch inner = new Switch(this);
+        inner.setText("内部总开关（仅应用自用，不可点击）");
+        inner.setTextSize(13);
+        inner.setTextColor(Color.rgb(150, 150, 155));
+        inner.setChecked(Store.internalOn);
+        inner.setEnabled(false);          // 用户点不了，只有服务自己能改
+        inner.setPadding(0, 0, 0, dp(8));
+        root.addView(inner);
+
         status = new TextView(this);
         status.setTextSize(15);
         status.setPadding(dp(14), dp(14), dp(14), dp(14));
@@ -133,11 +161,11 @@ public class MainActivity extends Activity {
         corner.setText("角落兜底（图片广告：盲点右上角）");
         corner.setTextSize(14);
         corner.setPadding(0, dp(10), 0, dp(2));
-        corner.setChecked(sp.getBoolean("corner_v4", false));
+        corner.setChecked(sp.getBoolean("corner_v5", false));
         corner.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton v, boolean on) {
-                getSharedPreferences("cfg", MODE_PRIVATE).edit().putBoolean("corner_v4", on).apply();
+                getSharedPreferences("cfg", MODE_PRIVATE).edit().putBoolean("corner_v5", on).apply();
             }
         });
         root.addView(corner);
@@ -209,10 +237,51 @@ public class MainActivity extends Activity {
         setContentView(sc);
     }
 
+    private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable refresh = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                View v = findViewById(android.R.id.content);
+                Switch inner = null;
+                if (v instanceof android.view.ViewGroup) {
+                    inner = findInner((android.view.ViewGroup) v);
+                }
+                if (inner != null) inner.setChecked(Store.internalOn);
+            } catch (Throwable ignored) {
+            }
+            ui.postDelayed(this, 400);
+        }
+    };
+
+    private Switch findInner(android.view.ViewGroup g) {
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c instanceof Switch) {
+                Switch sw = (Switch) c;
+                CharSequence t = sw.getText();
+                if (t != null && t.toString().startsWith("内部总开关")) return sw;
+            }
+            if (c instanceof android.view.ViewGroup) {
+                Switch r = findInner((android.view.ViewGroup) c);
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    protected void onPause() {
+        ui.removeCallbacks(refresh);
+        super.onPause();
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
-        boolean on = isServiceEnabled() && Store.enabled;
+        boolean enabledNow = isServiceEnabled();
+        if (banner != null) banner.setVisibility(enabledNow ? View.GONE : View.VISIBLE);
+        boolean on = enabledNow && Store.enabled;
         if (!Store.enabled) {
             status.setText("○ 总开关已关闭，当前不会跳过任何广告");
             status.setTextColor(Color.rgb(120, 120, 120));
@@ -234,6 +303,8 @@ public class MainActivity extends Activity {
                 + "\n累计跳过 " + Store.total + " 次");
         dbgView.setText(Store.dumpDbg());
         logView.setText(Store.dump());
+        ui.removeCallbacks(refresh);
+        ui.post(refresh);
     }
 
     private void showFeedback() {

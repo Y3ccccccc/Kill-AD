@@ -14,6 +14,8 @@ public final class Store {
 
     public static volatile boolean serviceOn = false;
     public static volatile boolean enabled = true;   // 总开关
+    public static volatile boolean internalOn = false; // 内部总开关（应用自用）
+    public static volatile String phase = "空闲";
     public static volatile int total = 0;
     public static volatile int eventCount = 0;
     public static volatile int scanCount = 0;

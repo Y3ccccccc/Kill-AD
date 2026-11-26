@@ -18,7 +18,7 @@ $JAVA/javac -nowarn -source 8 -target 8 -encoding UTF-8 \
 
 aapt package -f -J build/gen -M AndroidManifest.xml -S res -I "$JAR" \
   -F build/base.apk --min-sdk-version 21 --target-sdk-version 34 \
-  --version-code 24 --version-name 3.3
+  --version-code 32 --version-name 3.11
 
 $BT/d8 --release --min-api 21 --lib "$JAR" --output build/ \
   $(find build/obj -name '*.class')

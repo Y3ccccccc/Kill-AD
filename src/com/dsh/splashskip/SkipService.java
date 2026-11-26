@@ -24,8 +24,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 打开应用后的 10 秒内，每秒扫 10 次屏幕；见到「跳过 / 关闭」就点，
- * 最多连续点 3 次，然后彻底停手，等下一次切应用。
+ * 开屏广告跳过。
+ * 换应用后：20 秒内每秒扫 10 次，扫到「跳过/关闭」就点，最多三发；
+ * 三发打完或广告消失 → 进入 5 秒巡视期（只观察不点）；
+ * 巡视期内你一动，或 5 秒到 → 彻底终止，等下一次换应用。
  */
 public class SkipService extends AccessibilityService {
 
@@ -45,12 +47,10 @@ public class SkipService extends AccessibilityService {
             "com.android.intentresolver", "com.android.providers.media.module",
             "com.miui.filemanager", "com.android.mtp"));
 
-    private static final long WINDOW_MS = 20000;  // 前 20 秒密集扫
-    private static final long SCAN_MS = 100;      // 每秒 10 次
-    private static final long SCAN_SLOW_MS = 200; // 之后每秒 5 次
-    private static final long EXTRA_MS = 5000;    // 三发用完后再续 5 秒
-    private static final int MAX_CLICKS = 3;      // 头三发
-    private static final int MAX_EXTRA_CLICKS = 3;// 额外的三发（每次只点一下）
+    private static final long WINDOW_MS = 20000; // 第一阶段
+    private static final long SCAN_MS = 100;     // 每秒 10 次
+    private static final int MAX_CLICKS = 3;     // 三发
+    private static final long WATCH_MS = 5000;   // 第二阶段
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -59,16 +59,16 @@ public class SkipService extends AccessibilityService {
     private String huntPkg;
     private long startedAt;
     private int clicks;
-    private boolean finished;
-    private boolean scanning;
-    private long extraUntil;
-    private int blankTaps;
     private int okClicks;
+    private boolean scanning;
+    private boolean watching;
+    private long watchUntil;
+    private int blankTaps;
     private long lastBlankTap;
     private boolean cornerFallback;
-    private boolean cornerTried;
     private String lastTarget;
     private long lastClickAt;
+    private String lastTouchPkg;
     private boolean loggedNoCand;
     private boolean windowLogged;
     private static volatile SkipService INSTANCE;
@@ -76,15 +76,24 @@ public class SkipService extends AccessibilityService {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            if (finished || huntPkg == null) return;
+            if (!Store.enabled || !Store.internalOn) return;
             long now = SystemClock.uptimeMillis();
-            if (extraUntil > 0) {
-                if (now > extraUntil) return;
-            } else if (now - startedAt > WINDOW_MS) {
+
+            if (watching) {
+                if (now > watchUntil) {
+                    endHunt("巡视 5 秒结束");
+                } else {
+                    h.postDelayed(this, 200);
+                }
+                return;
+            }
+            if (huntPkg == null) return;
+            if (now - startedAt > WINDOW_MS) {
+                endHunt("第一阶段 20 秒到");
                 return;
             }
             if (scanning) {
-                h.postDelayed(this, clicks >= MAX_CLICKS ? SCAN_SLOW_MS : SCAN_MS);
+                h.postDelayed(this, SCAN_MS);
                 return;
             }
             scanning = true;
@@ -98,7 +107,7 @@ public class SkipService extends AccessibilityService {
                     } finally {
                         scanning = false;
                     }
-                    h.postDelayed(tick, clicks >= MAX_CLICKS ? SCAN_SLOW_MS : SCAN_MS);
+                    h.postDelayed(tick, SCAN_MS);
                 }
             });
         }
@@ -110,7 +119,6 @@ public class SkipService extends AccessibilityService {
         INSTANCE = this;
         Store.serviceOn = true;
         SharedPreferences sp = getSharedPreferences("cfg", MODE_PRIVATE);
-        cornerFallback = sp.getBoolean("corner_v4", false);
         Store.enabled = sp.getBoolean("master", true);
         Dbg.init(this);
         Dbg.note("服务已连接" + (Store.enabled ? "" : "（总开关关闭）"));
@@ -124,55 +132,73 @@ public class SkipService extends AccessibilityService {
         if (cs == null) return;
         String pkg = cs.toString();
         Store.lastPkg = pkg;
+        int type = e.getEventType();
+
+        boolean touch = type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || type == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED
+                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+                || type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+                || (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                    && (e.getScrollDeltaY() != 0 || e.getScrollDeltaX() != 0));
+
+        long now = SystemClock.uptimeMillis();
+
+        // 自己点的那一下不算
+        if (touch && now - lastClickAt > 900 && huntPkg != null && pkg.equals(huntPkg)) {
+            if (watching) {
+                endHunt("巡视期内检测到你开始操作");
+                return;
+            }
+            // 前 3 秒是“点图标”的手势，放过
+            if (now - startedAt > 3000) {
+                endHunt("检测到你开始操作");
+                return;
+            }
+        }
+
         if (!Store.enabled) {
-            cancel("总开关关闭");
+            endHunt("总开关关闭");
             return;
         }
         if (pkg.equals(getPackageName())) {
-            cancel("回到本应用");
+            endHunt("回到本应用");
             return;
         }
         if (IGNORE.contains(pkg)) {
-            // 桌面、最近任务、状态栏、系统界面：直接终断，不再等时间到
-            if (huntPkg != null && SystemClock.uptimeMillis() - startedAt > 1000) {
-                cancel("前台是桌面/系统界面");
+            if (huntPkg != null && now - startedAt > 1000) {
+                endHunt("前台是桌面/系统界面");
             }
             return;
         }
 
         if (!pkg.equals(huntPkg)) {
             huntPkg = pkg;
-            startedAt = SystemClock.uptimeMillis();
+            startedAt = now;
             clicks = 0;
             okClicks = 0;
-            extraUntil = 0;
             blankTaps = 0;
             lastBlankTap = 0;
-            finished = false;
-            cornerTried = false;
+            cornerFallback = getSharedPreferences("cfg", MODE_PRIVATE)
+                    .getBoolean("corner_v5", false);
+            lastTarget = null;
+            watching = false;
+            watchUntil = 0;
             loggedNoCand = false;
             windowLogged = false;
-            lastTarget = null;
-            SharedPreferences sp = getSharedPreferences("cfg", MODE_PRIVATE);
-                cornerFallback = sp.getBoolean("corner_v4", false);
-            Dbg.note("开始扫描 " + pkg + (cornerFallback ? " (兜底开)" : " (兜底关)"));
+            Store.internalOn = true;
+            Store.phase = "扫描中";
+            Dbg.note("开始扫描 " + pkg + " 内部开关已开" + (cornerFallback ? " (兜底开)" : " (兜底关)"));
             h.removeCallbacks(tick);
             h.post(tick);
         }
     }
 
-    /** 立刻终止当前这场扫描，直到下一次切应用。 */
-    private void cancel(String why) {
-        if (huntPkg != null) Dbg.note("终止扫描：" + why);
-        huntPkg = null;
-        finished = true;
-        extraUntil = 0;
-        h.removeCallbacks(tick);
-    }
-
     private void scan() {
-        if (finished || huntPkg == null) return;
         long now = SystemClock.uptimeMillis();
+        if (!Store.enabled || !Store.internalOn) return;
+        if (watching || huntPkg == null) return;
+        if (now - startedAt > WINDOW_MS) return;
+        if (clicks >= MAX_CLICKS) return;
 
         TEXTS.clear();
         List<Candidate> list = new ArrayList<Candidate>();
@@ -180,7 +206,6 @@ public class SkipService extends AccessibilityService {
         int winCount = 0;
         StringBuilder per = new StringBuilder();
 
-        // A 方案：把所有窗口都扫一遍（菜鸟那种广告在独立小窗里）
         List<AccessibilityWindowInfo> wins = null;
         try {
             wins = getWindows();
@@ -195,8 +220,8 @@ public class SkipService extends AccessibilityService {
                 }
                 if (r == null) continue;
                 CharSequence rp = r.getPackageName();
-                String pkg = rp == null ? "?" : rp.toString();
-                if (pkg.equals(getPackageName()) || IGNORE.contains(pkg)) continue;
+                String p = rp == null ? "?" : rp.toString();
+                if (p.equals(getPackageName()) || IGNORE.contains(p)) continue;
                 int[] c = new int[]{0};
                 try {
                     collect(r, list, 0, c);
@@ -215,8 +240,8 @@ public class SkipService extends AccessibilityService {
             }
             if (root == null) return;
             CharSequence rp = root.getPackageName();
-            String pkg = rp == null ? "?" : rp.toString();
-            if (pkg.equals(getPackageName()) || IGNORE.contains(pkg)) return;
+            String p = rp == null ? "?" : rp.toString();
+            if (p.equals(getPackageName()) || IGNORE.contains(p)) return;
             try {
                 collect(root, list, 0, total);
             } catch (Throwable ignored) {
@@ -237,21 +262,19 @@ public class SkipService extends AccessibilityService {
                 Dbg.note("无候选 " + huntPkg + " 窗口 " + winCount + " 节点 " + total[0]
                         + " 文本 " + joinTexts());
             }
-            // 什么都读不到：无脑点右上角（最多 3 次，间隔 900ms）
-            if (cornerFallback && okClicks == 0 && blankTaps < 3 && now - lastBlankTap > 900) {
+            // 点过之后 1 秒还扫不到关键字：广告已关掉，进巡视
+            if (clicks > 0 && now - lastClickAt > 1000) {
+                startWatch("广告已关闭");
+                return;
+            }
+            // 一次都没点过又读不到：兜底盲点（默认关）
+            if (cornerFallback && blankTaps < 3 && now - lastBlankTap > 900) {
                 blankTaps++;
                 lastBlankTap = now;
                 tapFixedCorner();
                 Dbg.note("无候选，盲点右上角 第 " + blankTaps + " 次 " + huntPkg);
-                if (blankTaps >= 3) {
-                    // 三档盲点做完：立刻收手，不再扫描也不再点
-                    finished = true;
-                    extraUntil = 0;
-                    h.removeCallbacks(tick);
-                    Dbg.note("三档盲点完成，终止全部操作");
-                }
+                if (blankTaps >= 3) endHunt("三档盲点做完");
             }
-
             return;
         }
 
@@ -261,12 +284,6 @@ public class SkipService extends AccessibilityService {
 
         final Candidate target = best;
         final String pkg = huntPkg;
-        final boolean sameAsLast = target.text.equals(lastTarget) && now - lastClickAt < 900;
-        if (clicks >= MAX_CLICKS && target.text.equals(lastTarget)
-                && now - lastClickAt < 600) {
-            return;   // 补充阶段：同一个按钮别连点
-        }
-
         h.post(new Runnable() {
             @Override
             public void run() {
@@ -277,27 +294,45 @@ public class SkipService extends AccessibilityService {
                     where = " @(" + r.centerX() + "," + r.centerY() + ")";
                 } catch (Throwable ignored) {
                 }
-                Dbg.note((sameAsLast ? "补点 " : "点击 ") + pkg + " → " + target.text + where
-                        + " 第 " + (clicks + 1) + " 次");
                 lastTarget = target.text;
                 lastClickAt = SystemClock.uptimeMillis();
                 clicks++;
+                okClicks++;
+                Dbg.note("点击 " + pkg + " → " + target.text + where
+                        + " 第 " + clicks + "/" + MAX_CLICKS + " 发");
                 if (perform(target)) {
                     Store.hitCount++;
-                    okClicks++;
                     Store.log(pkg, target.text);
                 }
-                if (clicks == MAX_CLICKS && extraUntil == 0) {
-                    extraUntil = SystemClock.uptimeMillis() + EXTRA_MS;
-                    Dbg.note("头三发用完，进入补充阶段：每秒 5 次，再续 5 秒");
-                }
-                if (clicks >= MAX_CLICKS + MAX_EXTRA_CLICKS) {
-                    finished = true;
-                    Dbg.note("补充三发也用完，停止扫描");
-                    extraUntil = 0;
+                if (clicks >= MAX_CLICKS) {
+                    startWatch("三发打完");
                 }
             }
         });
+    }
+
+    private void startWatch(String why) {
+        if (watching) return;
+        watching = true;
+        watchUntil = SystemClock.uptimeMillis() + WATCH_MS;
+        Store.phase = "巡视中";
+        Dbg.note("进入巡视期 5 秒（" + why + "）");
+    }
+
+    private void endHunt(String why) {
+        boolean had = hunting();
+        watching = false;
+        watchUntil = 0;
+        huntPkg = null;
+        clicks = 0;
+        Store.internalOn = false;
+        Store.phase = "空闲";
+        h.removeCallbacks(tick);
+        if (had) Dbg.note("终止：" + why);
+    }
+
+    private boolean hunting() {
+        return huntPkg != null || watching;
     }
 
     private static final class Candidate {
@@ -375,11 +410,9 @@ public class SkipService extends AccessibilityService {
         }
     }
 
-    /** 见到「跳过 / 关闭广告 / 关闭」就点；不用 x、×、单字母（误伤太大）。 */
     private int score(String raw) {
         String s = raw.toLowerCase(Locale.ROOT).replace(" ", "").replace("\u00a0", "");
         if (s.isEmpty()) return 0;
-
         if (s.contains("跳过")) {
             if (s.contains("开屏")) return 0;
             if (s.length() > 16) return 0;
@@ -389,53 +422,6 @@ public class SkipService extends AccessibilityService {
         if (s.startsWith("skip") || s.endsWith("skip")) return 120;
         if (s.length() <= 4 && s.contains("关闭")) return 80;
         return 0;
-    }
-
-    private boolean tapCornerNode(AccessibilityNodeInfo root) {
-        DisplayMetrics dm = getResources().getDisplayMetrics();
-        int w = dm.widthPixels, hh = dm.heightPixels;
-        List<AccessibilityNodeInfo> hits = new ArrayList<AccessibilityNodeInfo>();
-        collectCorner(root, hits, 0, w, hh);
-        if (hits.isEmpty()) return false;
-        AccessibilityNodeInfo best = null;
-        Rect br = new Rect(), r = new Rect();
-        for (AccessibilityNodeInfo n : hits) {
-            n.getBoundsInScreen(r);
-            if (best == null || r.width() * (long) r.height() < br.width() * (long) br.height()) {
-                best = n;
-                best.getBoundsInScreen(br);
-            }
-        }
-        try {
-            if (best.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
-            best.getBoundsInScreen(r);
-            return tap(r.centerX(), r.centerY());
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private void collectCorner(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> out,
-                               int depth, int w, int hh) {
-        if (n == null || depth > 40 || out.size() > 8) return;
-        try {
-            Rect r = new Rect();
-            n.getBoundsInScreen(r);
-            boolean inCorner = r.left > w * 0.62f && r.top < hh * 0.16f
-                    && r.width() > 12 && r.width() < w * 0.35f
-                    && r.height() > 12 && r.height() < hh * 0.12f;
-            boolean blank = (n.getText() == null || n.getText().length() == 0)
-                    && (n.getContentDescription() == null || n.getContentDescription().length() == 0);
-            if (inCorner && blank && n.isClickable() && n.isVisibleToUser()) out.add(n);
-        } catch (Throwable ignored) {
-        }
-        int kids = n.getChildCount();
-        for (int i = 0; i < kids; i++) {
-            try {
-                collectCorner(n.getChild(i), out, depth + 1, w, hh);
-            } catch (Throwable ignored) {
-            }
-        }
     }
 
     /** 三档盲点：菜鸟（贴顶）、百度网盘（状态栏下）、带标题栏的样式。 */
@@ -520,6 +506,8 @@ public class SkipService extends AccessibilityService {
         Dbg.note("服务销毁");
         Dbg.flushNow();
         INSTANCE = null;
+        Store.internalOn = false;
+        Store.phase = "空闲";
         Store.serviceOn = false;
         super.onDestroy();
     }
