@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">杀死广告</string>
+    <string name="service_label">跳过开屏广告（无障碍服务）</string>
+    <string name="desc">识别应用启动时的开屏广告，自动点击「跳过 / 关闭」按钮，不联网、不收集数据。</string>
+    <string name="app_title">跳过开屏广告</string>
+</resources>
